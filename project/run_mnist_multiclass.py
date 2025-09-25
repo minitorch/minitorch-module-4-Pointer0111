@@ -41,8 +41,11 @@ class Conv2d(minitorch.Module):
         self.bias = RParam(out_channels, 1, 1)
 
     def forward(self, input):
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # Apply 2D convolution and add bias
+        conv_out = minitorch.conv2d(input, self.weights.value)
+        # Broadcast bias to match conv_out shape
+        bias_expanded = self.bias.value.view(1, self.bias.value.shape[0], 1, 1)
+        return conv_out + bias_expanded
 
 
 class Network(minitorch.Module):
@@ -67,12 +70,37 @@ class Network(minitorch.Module):
         self.mid = None
         self.out = None
 
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # Define network layers
+        self.conv1 = Conv2d(1, 4, 3, 3)  # 1 input channel, 4 output channels, 3x3 kernel
+        self.conv2 = Conv2d(4, 8, 3, 3)  # 4 input channels, 8 output channels, 3x3 kernel
+        self.linear1 = Linear(8 * 7 * 7, 64)  # After pooling: 8 channels * 7 * 7 = 392
+        self.linear2 = Linear(64, C)  # 64 -> 10 classes
+        self.dropout = minitorch.Dropout(0.25)
 
     def forward(self, x):
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # 1. Apply first convolution with 4 output channels and 3x3 kernel followed by ReLU
+        self.mid = self.conv1(x).relu()
+        
+        # 2. Apply second convolution with 8 output channels and 3x3 kernel followed by ReLU  
+        self.out = self.conv2(self.mid).relu()
+        
+        # 3. Apply 2D max pooling with 4x4 kernel
+        # From 28x28 -> 7x7 after 4x4 pooling
+        pooled = minitorch.avgpool2d(self.out, (4, 4))
+        
+        # 4. Flatten channels, height, and width (should be BATCHx392)
+        batch_size = pooled.shape[0]
+        flattened = pooled.view(batch_size, 8 * 7 * 7)
+        
+        # 5. Apply Linear to size 64 followed by ReLU and Dropout with rate 25%
+        linear1_out = self.linear1(flattened).relu()
+        dropout_out = self.dropout(linear1_out)
+        
+        # 6. Apply Linear to size C (number of classes)
+        linear2_out = self.linear2(dropout_out)
+        
+        # 7. Apply logsoftmax over the class dimension
+        return minitorch.logsoftmax(linear2_out, dim=1)
 
 
 def make_mnist(start, stop):
