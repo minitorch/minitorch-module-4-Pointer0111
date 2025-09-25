@@ -149,3 +149,19 @@ class Parameter:
 
     def __str__(self) -> str:
         return str(self.value)
+
+
+class Dropout(Module):
+    """Dropout layer that randomly zeros some elements during training."""
+    
+    def __init__(self, p: float = 0.5) -> None:
+        """Initialize dropout with probability p of zeroing elements."""
+        super().__init__()
+        self.p = p
+    
+    def forward(self, input: Any) -> Any:
+        """Apply dropout to input tensor."""
+        from . import nn
+        # Use the dropout function from nn.py
+        # When training=True, apply dropout; when training=False, ignore=True
+        return nn.dropout(input, self.p, ignore=not self.training)
