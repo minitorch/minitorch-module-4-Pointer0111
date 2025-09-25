@@ -35,8 +35,65 @@ def tile(input: Tensor, kernel: Tuple[int, int]) -> Tuple[Tensor, int, int]:
     kh, kw = kernel
     assert height % kh == 0
     assert width % kw == 0
-    # TODO: Implement for Task 4.3.
-    raise NotImplementedError("Need to implement for Task 4.3")
+    new_h = height // kh
+    new_w = width // kw
+    # (B, C, H, W) -> (B, C, new_h, kh, new_w, kw)
+    t = input.contiguous().view(batch, channel, new_h, kh, new_w, kw)
+    # -> (B, C, new_h, new_w, kh, kw)
+    t = t.permute(0, 1, 2, 4, 3, 5)
+    # -> (B, C, new_h, new_w, kh*kw)
+    t = t.contiguous().view(batch, channel, new_h, new_w, kh * kw)
+    return t, new_h, new_w
 
 
-# TODO: Implement for Task 4.3.
+def avgpool2d(input: Tensor, kernel: Tuple[int, int]) -> Tensor:
+    t, new_h, new_w = tile(input, kernel)
+    kh, kw = kernel
+    # sum over last dim then divide by window size
+    out = t.sum(dim=4).view(input.shape[0], input.shape[1], new_h, new_w) / (kh * kw)
+    return out
+
+
+# Max reduction along a dimension using FastOps.reduce with operators.max
+_reduce_max = FastOps.reduce(operators.max, start=-1e30)
+
+
+def max(input: Tensor, dim: int) -> Tensor:  # type: ignore[override]
+    return _reduce_max(input, dim)
+
+
+def argmax(input: Tensor, dim: int) -> Tensor:
+    # one-hot along dim: eq to max broadcasted
+    m = max(input, dim)
+    return input == m  # type: ignore[return-value]
+
+
+def maxpool2d(input: Tensor, kernel: Tuple[int, int]) -> Tensor:
+    t, new_h, new_w = tile(input, kernel)
+    out = max(t, 4).view(input.shape[0], input.shape[1], new_h, new_w)
+    return out
+
+
+def softmax(input: Tensor, dim: int) -> Tensor:
+    # stable softmax: exp(x - max) / sum(exp(x - max))
+    m = max(input, dim)
+    shifted = input - m
+    ex = shifted.exp()
+    z = ex.sum(dim)
+    return ex / z
+
+
+def logsoftmax(input: Tensor, dim: int) -> Tensor:
+    m = max(input, dim)
+    shifted = input - m
+    log_z = shifted.exp().sum(dim).log()
+    return shifted - log_z
+
+
+def dropout(input: Tensor, p: float, ignore: bool = False) -> Tensor:
+    if ignore:
+        return input
+    # mask_keep = 1 where r >= p, else 0
+    r = rand(input.shape)
+    keep = (r < p) == 0.0
+    return input * keep
