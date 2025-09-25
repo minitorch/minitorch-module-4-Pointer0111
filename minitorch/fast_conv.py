@@ -90,8 +90,32 @@ def _tensor_conv1d(
     s1 = input_strides
     s2 = weight_strides
 
-    # TODO: Implement for Task 4.1.
-    raise NotImplementedError("Need to implement for Task 4.1")
+    # inners
+    s10, s11, s12 = s1[0], s1[1], s1[2]
+    s20, s21, s22 = s2[0], s2[1], s2[2]
+
+    for b in prange(batch_):
+        for oc in range(out_channels):
+            for x in range(out_width):
+                acc = 0.0
+                w_base = oc * s20
+                for ic in range(in_channels):
+                    w_ic_base = w_base + ic * s21
+                    in_ic_base = b * s10 + ic * s11
+                    if not reverse:
+                        # Anchor left: input index = x + k
+                        for k in range(kw):
+                            in_x = x + k
+                            if 0 <= in_x < width:
+                                acc += input[in_ic_base + in_x * s12] * weight[w_ic_base + k * s22]
+                    else:
+                        # Anchor right: input index = x - k
+                        for k in range(kw):
+                            in_x = x - k
+                            if 0 <= in_x < width:
+                                acc += input[in_ic_base + in_x * s12] * weight[w_ic_base + k * s22]
+                out[b * out_strides[0] + oc * out_strides[1] + x * out_strides[2]] = acc
+
 
 
 tensor_conv1d = njit(_tensor_conv1d, parallel=True)
@@ -219,8 +243,41 @@ def _tensor_conv2d(
     s10, s11, s12, s13 = s1[0], s1[1], s1[2], s1[3]
     s20, s21, s22, s23 = s2[0], s2[1], s2[2], s2[3]
 
-    # TODO: Implement for Task 4.2.
-    raise NotImplementedError("Need to implement for Task 4.2")
+    out_height, out_width = out_shape[2], out_shape[3]
+
+    for b in prange(batch_):
+        for oc in range(out_channels):
+            for y in range(out_height):
+                for x in range(out_width):
+                    acc = 0.0
+                    w_base = oc * s20
+                    for ic in range(in_channels):
+                        w_ic_base = w_base + ic * s21
+                        in_ic_base = b * s10 + ic * s11
+                        if not reverse:
+                            # Top-left anchor: (y + ky, x + kx)
+                            for ky in range(kh):
+                                in_y = y + ky
+                                if 0 <= in_y < height:
+                                    wy_base = w_ic_base + ky * s22
+                                    for kx in range(kw):
+                                        in_x = x + kx
+                                        if 0 <= in_x < width:
+                                            acc += input[in_ic_base + in_y * s12 + in_x * s13] * \
+                                                   weight[wy_base + kx * s23]
+                        else:
+                            # Bottom-right anchor: (y - ky, x - kx)
+                            for ky in range(kh):
+                                in_y = y - ky
+                                if 0 <= in_y < height:
+                                    wy_base = w_ic_base + ky * s22
+                                    for kx in range(kw):
+                                        in_x = x - kx
+                                        if 0 <= in_x < width:
+                                            acc += input[in_ic_base + in_y * s12 + in_x * s13] * \
+                                                   weight[wy_base + kx * s23]
+                    out[b * out_strides[0] + oc * out_strides[1] + y * out_strides[2] + x * out_strides[3]] = acc
+
 
 
 tensor_conv2d = njit(_tensor_conv2d, parallel=True, fastmath=True)

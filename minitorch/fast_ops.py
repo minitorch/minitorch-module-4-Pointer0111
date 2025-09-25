@@ -168,7 +168,39 @@ def tensor_map(
         in_shape: Shape,
         in_strides: Strides,
     ) -> None:
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：
+        # - 并行：使用 prange 对外层元素循环进行并行切分（numba 会在多线程间分配 i 的区间）。
+        # - 索引缓冲：所有多维索引缓冲使用 numpy 数组，避免 Python 对象参与循环。
+        # - 对齐优化：当 out 与 in 在形状和 strides 完全一致时，跳过广播与索引计算，直接同一位置读写。
+        n = len(out)
+        same_shape = len(out_shape) == len(in_shape)
+        if same_shape:
+            for d in range(len(out_shape)):
+                if out_shape[d] != in_shape[d]:
+                    same_shape = False
+                    break
+        aligned = same_shape
+        if aligned:
+            for d in range(len(out_strides)):
+                if out_strides[d] != in_strides[d]:
+                    aligned = False
+                    break
+        for i in prange(n):
+            if aligned:
+                # 对齐路径：只需计算一次 out 的线性位置，直接用相同位置访问 in/out
+                out_index = np.zeros(len(out_shape), dtype=np.int32)
+                to_index(i, out_shape, out_index)
+                out_pos = index_to_position(out_index, out_strides)
+                out[out_pos] = fn(in_storage[out_pos])
+            else:
+                # 非对齐/需广播路径：根据 out_index 计算 in_index，再各自转位置
+                out_index = np.zeros(len(out_shape), dtype=np.int32)
+                to_index(i, out_shape, out_index)
+                in_index = np.zeros(len(in_shape), dtype=np.int32)
+                broadcast_index(out_index, out_shape, in_shape, in_index)
+                in_pos = index_to_position(in_index, in_strides)
+                out_pos = index_to_position(out_index, out_strides)
+                out[out_pos] = fn(in_storage[in_pos])
 
     return njit(_map, parallel=True)  # type: ignore
 
@@ -207,7 +239,45 @@ def tensor_zip(
         b_shape: Shape,
         b_strides: Strides,
     ) -> None:
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：
+        # - 并行：对 out 的每个元素位置并行计算 a 与 b 对应（含广播）的值，应用二元 fn。
+        # - 对齐优化：当 out/a/b 形状与 strides 完全一致时，直接用相同线性位置读写，省去三次索引转换。
+        n = len(out)
+        same_shape = (
+            len(out_shape) == len(a_shape) == len(b_shape)
+        )
+        if same_shape:
+            for d in range(len(out_shape)):
+                if not (out_shape[d] == a_shape[d] == b_shape[d]):
+                    same_shape = False
+                    break
+        aligned = same_shape
+        if aligned:
+            for d in range(len(out_strides)):
+                if not (
+                    out_strides[d] == a_strides[d] == b_strides[d]
+                ):
+                    aligned = False
+                    break
+        for i in prange(n):
+            if aligned:
+                # 对齐路径：只算一次 out 的位置，同步用于 a、b、out
+                out_index = np.zeros(len(out_shape), dtype=np.int32)
+                to_index(i, out_shape, out_index)
+                pos = index_to_position(out_index, out_strides)
+                out[pos] = fn(a_storage[pos], b_storage[pos])
+            else:
+                # 非对齐/广播路径：为 a、b 分别计算广播后的索引与线性位置
+                out_index = np.zeros(len(out_shape), dtype=np.int32)
+                to_index(i, out_shape, out_index)
+                a_index = np.zeros(len(a_shape), dtype=np.int32)
+                broadcast_index(out_index, out_shape, a_shape, a_index)
+                b_index = np.zeros(len(b_shape), dtype=np.int32)
+                broadcast_index(out_index, out_shape, b_shape, b_index)
+                a_pos = index_to_position(a_index, a_strides)
+                b_pos = index_to_position(b_index, b_strides)
+                out_pos = index_to_position(out_index, out_strides)
+                out[out_pos] = fn(a_storage[a_pos], b_storage[b_pos])
 
     return njit(_zip, parallel=True)  # type: ignore
 
@@ -242,7 +312,28 @@ def tensor_reduce(
         a_strides: Strides,
         reduce_dim: int,
     ) -> None:
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：
+        # - 并行：对每个 out 位置（即已压缩维为 1 的形状）并行做一条独立的归约。
+        # - 内层循环优化：先计算 a 的起始线性位置与步长 step，仅做简单的线性步进和 fn 调用，无额外索引函数调用。
+        n = len(out)
+        reduce_size = a_shape[reduce_dim]
+        for i in prange(n):
+            out_index = np.zeros(len(out_shape), dtype=np.int32)
+            to_index(i, out_shape, out_index)
+            out_pos = index_to_position(out_index, out_strides)
+            acc = out[out_pos]
+
+            # 构造在 reduce_dim = 0 时的基准索引，然后通过步长线性前进
+            a_index = out_index.copy()
+            a_index[reduce_dim] = 0
+            a_pos = index_to_position(a_index, a_strides)
+            step = a_strides[reduce_dim]
+
+            # 仅进行内存线性访问与函数累积，避免在内层做昂贵的索引变换
+            for j in range(reduce_size):
+                acc = fn(acc, a_storage[a_pos + j * step])
+
+            out[out_pos] = acc
 
     return njit(_reduce, parallel=True)  # type: ignore
 
@@ -293,7 +384,40 @@ def _tensor_matrix_multiply(
     a_batch_stride = a_strides[0] if a_shape[0] > 1 else 0
     b_batch_stride = b_strides[0] if b_shape[0] > 1 else 0
 
-    raise NotImplementedError("Need to include this file from past assignment.")
+    # 中文说明：外层并行遍历 out 的所有 (n, i, j) 位置；
+    # 使用 strides 做线性地址计算；内层仅做一次乘法与本地累加，无全局写。
+    N = out_shape[0]
+    I = out_shape[1]
+    J = out_shape[2]
+    K = a_shape[2]  # a_shape[-1] == b_shape[-2]
+
+    total = N * I * J
+    for idx in prange(total):
+        # 反算 (n, i, j)，避免调用任何索引函数
+        n = idx // (I * J)
+        rem = idx - n * (I * J)
+        i = rem // J
+        j = rem - i * J
+
+        # 线性位置（out）
+        out_pos = n * out_strides[0] + i * out_strides[1] + j * out_strides[2]
+
+        # 批次广播：当某输入的 batch 维为 1 时，其 batch stride 设为 0
+        a_batch_off = n * a_batch_stride
+        b_batch_off = n * b_batch_stride
+
+        # 累加到局部寄存器
+        acc = 0.0
+        a_row_base = a_batch_off + i * a_strides[1]
+        b_col_base = b_batch_off + j * b_strides[2]
+        a_k_stride = a_strides[2]
+        b_k_stride = b_strides[1]
+
+        for k in range(K):
+            acc += a_storage[a_row_base + k * a_k_stride] * b_storage[b_col_base + k * b_k_stride]
+
+        # 单次全局写
+        out[out_pos] = acc
 
 
 tensor_matrix_multiply = njit(_tensor_matrix_multiply, parallel=True)

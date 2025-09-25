@@ -34,8 +34,12 @@ class Conv1d(minitorch.Module):
         self.bias = RParam(1, out_channels, 1)
 
     def forward(self, input):
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # Apply 1D convolution and add bias
+        # Input shape: [batch, in_channels, length]
+        conv_out = minitorch.conv1d(input, self.weights.value)
+        # Broadcast bias to match conv_out shape
+        bias_expanded = self.bias.value.view(1, self.bias.value.shape[1], 1)
+        return conv_out + bias_expanded
 
 
 class CNNSentimentKim(minitorch.Module):
@@ -61,15 +65,50 @@ class CNNSentimentKim(minitorch.Module):
     ):
         super().__init__()
         self.feature_map_size = feature_map_size
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        
+        # Create convolution layers for different filter sizes
+        self.conv_layers = []
+        for filter_size in filter_sizes:
+            conv = Conv1d(embedding_size, feature_map_size, filter_size)
+            self.conv_layers.append(conv)
+        
+        # Linear layer for classification (total features = feature_map_size * number of filters)
+        total_features = feature_map_size * len(filter_sizes)
+        self.linear = Linear(total_features, 1)  # Binary classification
+        self.dropout = minitorch.Dropout(dropout)
 
     def forward(self, embeddings):
         """
         embeddings tensor: [batch x sentence length x embedding dim]
         """
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # Reshape to [batch x embedding_dim x sentence_length] for conv1d
+        batch_size, seq_len, embedding_dim = embeddings.shape
+        embeddings = embeddings.permute(0, 2, 1)  # [batch, embedding_dim, seq_len]
+        
+        # 1. Apply 1d convolution with different kernel sizes followed by ReLU
+        conv_outputs = []
+        for conv_layer in self.conv_layers:
+            # Apply convolution and ReLU
+            conv_out = conv_layer(embeddings).relu()
+            conv_outputs.append(conv_out)
+        
+        # 2. Apply max-over-time across each feature map
+        pooled_outputs = []
+        for conv_out in conv_outputs:
+            # Max pooling over the time dimension (last dimension)
+            # conv_out shape: [batch, feature_map_size, conv_length]
+            max_pooled = minitorch.max(conv_out, dim=2)  # [batch, feature_map_size]
+            pooled_outputs.append(max_pooled)
+        
+        # Concatenate all pooled outputs
+        concatenated = minitorch.cat(pooled_outputs, dim=1)  # [batch, total_features]
+        
+        # 3. Apply Linear followed by ReLU and Dropout
+        linear_out = self.linear(concatenated).relu()
+        dropout_out = self.dropout(linear_out)
+        
+        # 4. Apply sigmoid over the class dimension
+        return dropout_out.sigmoid()
 
 
 # Evaluation helper methods

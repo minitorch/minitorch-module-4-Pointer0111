@@ -31,25 +31,31 @@ class Module:
 
     def train(self) -> None:
         """Set the mode of this module and all descendent modules to `train`."""
-        raise NotImplementedError("Need to include this file from past assignment.")
+        self.training = True
+        for m in self.modules():
+            m.train()
 
     def eval(self) -> None:
         """Set the mode of this module and all descendent modules to `eval`."""
-        raise NotImplementedError("Need to include this file from past assignment.")
+        self.training = False
+        for m in self.modules():
+            m.eval()
 
     def named_parameters(self) -> Sequence[Tuple[str, Parameter]]:
-        """Collect all the parameters of this module and its descendents.
-
-        Returns
-        -------
-            The name and `Parameter` of each ancestor parameter.
-
-        """
-        raise NotImplementedError("Need to include this file from past assignment.")
+        """Collect all the parameters of this module and its descendents."""
+        result = []
+        # 当前模块参数
+        for k, v in self._parameters.items():
+            result.append((k, v))
+        # 子模块参数
+        for name, module in self._modules.items():
+            for k, v in module.named_parameters():
+                result.append((f"{name}.{k}", v))
+        return result
 
     def parameters(self) -> Sequence[Parameter]:
         """Enumerate over all the parameters of this module and its descendents."""
-        raise NotImplementedError("Need to include this file from past assignment.")
+        return [p for _, p in self.named_parameters()]
 
     def add_parameter(self, k: str, v: Any) -> Parameter:
         """Manually add a parameter. Useful helper for scalar parameters.
@@ -143,3 +149,19 @@ class Parameter:
 
     def __str__(self) -> str:
         return str(self.value)
+
+
+class Dropout(Module):
+    """Dropout layer that randomly zeros some elements during training."""
+    
+    def __init__(self, p: float = 0.5) -> None:
+        """Initialize dropout with probability p of zeroing elements."""
+        super().__init__()
+        self.p = p
+    
+    def forward(self, input: Any) -> Any:
+        """Apply dropout to input tensor."""
+        from . import nn
+        # Use the dropout function from nn.py
+        # When training=True, apply dropout; when training=False, ignore=True
+        return nn.dropout(input, self.p, ignore=not self.training)

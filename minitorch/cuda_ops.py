@@ -173,7 +173,14 @@ def tensor_map(
         out_index = cuda.local.array(MAX_DIMS, numba.int32)
         in_index = cuda.local.array(MAX_DIMS, numba.int32)
         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：每个线程处理一个 out 线性位置 i；使用本地寄存器数组保存索引缓冲；
+        # 广播规则：由 out_index 通过 broadcast_index 计算 in_index。
+        if i < out_size:
+            to_index(i, out_shape, out_index)
+            broadcast_index(out_index, out_shape, in_shape, in_index)
+            in_pos = index_to_position(in_index, in_strides)
+            out_pos = index_to_position(out_index, out_strides)
+            out[out_pos] = fn(in_storage[in_pos])
 
     return cuda.jit()(_map)  # type: ignore
 
@@ -215,7 +222,15 @@ def tensor_zip(
         b_index = cuda.local.array(MAX_DIMS, numba.int32)
         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
 
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：每个线程计算 out[i] 对应的 a、b 广播索引，应用二元 fn 写回。
+        if i < out_size:
+            to_index(i, out_shape, out_index)
+            broadcast_index(out_index, out_shape, a_shape, a_index)
+            broadcast_index(out_index, out_shape, b_shape, b_index)
+            a_pos = index_to_position(a_index, a_strides)
+            b_pos = index_to_position(b_index, b_strides)
+            out_pos = index_to_position(out_index, out_strides)
+            out[out_pos] = fn(a_storage[a_pos], b_storage[b_pos])
 
     return cuda.jit()(_zip)  # type: ignore
 
@@ -247,7 +262,24 @@ def _sum_practice(out: Storage, a: Storage, size: int) -> None:
     i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
     pos = cuda.threadIdx.x
 
-    raise NotImplementedError("Need to include this file from past assignment.")
+    # 中文说明：每个块对自身负责的 BLOCK_DIM 段做求和；
+    # - 将全局内存的数据拷入共享内存 cache[pos]
+    # - 在块内做并行规约，最后由 pos==0 的线程写回 out[blockIdx.x]
+    val = 0.0
+    if i < size:
+        val = a[i]
+    cache[pos] = val
+    cuda.syncthreads()
+
+    stride = BLOCK_DIM // 2
+    while stride > 0:
+        if pos < stride:
+            cache[pos] += cache[pos + stride]
+        cuda.syncthreads()
+        stride //= 2
+
+    if pos == 0:
+        out[cuda.blockIdx.x] = cache[0]
 
 
 jit_sum_practice = cuda.jit()(_sum_practice)
@@ -297,7 +329,42 @@ def tensor_reduce(
         out_pos = cuda.blockIdx.x
         pos = cuda.threadIdx.x
 
-        raise NotImplementedError("Need to include this file from past assignment.")
+        # 中文说明：本核计算分块的部分归约结果。
+        # out 的形状与 a 相同，唯独在 reduce_dim 维上为 (a_dim + BLOCK_DIM - 1) // BLOCK_DIM。
+        # 每个块对应 reduce_dim 上的一个分块 c = out_index[reduce_dim]，块内 1024 个线程处理该分块的元素。
+        to_index(out_pos, out_shape, out_index)
+
+        # 计算该分块在线性空间中的起点：chunk_start
+        chunk_start = out_index[reduce_dim] * BLOCK_DIM
+
+        # 构造 a 的基准索引（其它维度与 out_index 相同，reduce_dim 改为 chunk_start + pos）
+        a_index = cuda.local.array(MAX_DIMS, numba.int32)
+        for d in range(MAX_DIMS):
+            a_index[d] = 0
+        # 将 out_index 拷贝到 a_index
+        for d in range(len(a_shape)):
+            a_index[d] = out_index[d]
+        a_index[reduce_dim] = chunk_start + pos
+
+        # 若越界（最后一个分块可能不足 BLOCK_DIM），使用归约初值。
+        val = reduce_value
+        if a_index[reduce_dim] < a_shape[reduce_dim]:
+            a_pos = index_to_position(a_index, a_strides)
+            val = a_storage[a_pos]
+        cache[pos] = val
+        cuda.syncthreads()
+
+        # 块内并行规约：仅调用二元 fn，将共享内存规约到 cache[0]
+        stride = BLOCK_DIM // 2
+        while stride > 0:
+            if pos < stride:
+                cache[pos] = fn(cache[pos], cache[pos + stride])
+            cuda.syncthreads()
+            stride //= 2
+
+        if pos == 0:
+            out_linear_pos = index_to_position(out_index, out_strides)
+            out[out_linear_pos] = cache[0]
 
     return jit(_reduce)  # type: ignore
 
@@ -334,7 +401,35 @@ def _mm_practice(out: Storage, a: Storage, b: Storage, size: int) -> None:
 
     """
     BLOCK_DIM = 32
-    raise NotImplementedError("Need to include this file from past assignment.")
+    # 共享内存缓冲：存放 A 与 B 的整块（size < 32，单块足以容纳全矩阵）
+    shared_a = cuda.shared.array((BLOCK_DIM, BLOCK_DIM), numba.float64)
+    shared_b = cuda.shared.array((BLOCK_DIM, BLOCK_DIM), numba.float64)
+
+    # 线程块内坐标（用于装载/计算）
+    i = cuda.threadIdx.x
+    j = cuda.threadIdx.y
+
+    # 仅当索引在矩阵内才从全局内存装载，否则填 0，保证只读一次全局内存
+    if i < size and j < size:
+        # A 的 strides = [size, 1]，线性位置 = i*size + j
+        shared_a[i, j] = a[i * size + j]
+        # B 的 strides = [size, 1]，线性位置 = i*size + j
+        shared_b[i, j] = b[i * size + j]
+    else:
+        shared_a[i, j] = 0.0
+        shared_b[i, j] = 0.0
+
+    # 等待所有线程装载完成
+    cuda.syncthreads()
+
+    # 计算单个输出 out[i, j]（每个线程负责一个 i,j）
+    acc = 0.0
+    if i < size and j < size:
+        # acc = sum_k A[i,k] * B[k,j]，全部使用共享内存
+        for k in range(size):
+            acc += shared_a[i, k] * shared_b[k, j]
+        # 仅一次写回到全局内存：out 的 strides = [size, 1]
+        out[i * size + j] = acc
 
 
 jit_mm_practice = jit(_mm_practice)
@@ -397,12 +492,54 @@ def _tensor_matrix_multiply(
     pi = cuda.threadIdx.x
     pj = cuda.threadIdx.y
 
-    # Code Plan:
-    # 1) Move across shared dimension by block dim.
-    #    a) Copy into shared memory for a matrix.
-    #    b) Copy into shared memory for b matrix
-    #    c) Compute the dot produce for position c[i, j]
-    raise NotImplementedError("Need to include this file from past assignment.")
+    # 读取输出与 K 维度信息
+    N = out_shape[0]  # 批次（仅用于边界/广播判断）
+    I = out_shape[1]  # 行数
+    J = out_shape[2]  # 列数
+    K = a_shape[2]    # 共享维度，满足 a_shape[-1] == b_shape[-2]
+
+    # 批次偏移（考虑广播：当某输入 batch 维为 1 时，其 batch stride = 0）
+    a_batch_off = batch * a_batch_stride
+    b_batch_off = batch * b_batch_stride
+
+    # 累加寄存器
+    acc = 0.0
+
+    # 沿 K 维按 BLOCK_DIM 进行分块装载与计算
+    tiles = (K + BLOCK_DIM - 1) // BLOCK_DIM
+    for t in range(tiles):
+        # tile 内 k 的全局列（对 A）与全局行（对 B）
+        k_a = t * BLOCK_DIM + pj
+        k_b = t * BLOCK_DIM + pi
+
+        # 将 A 的一块搬入共享内存：A[i, k_a]
+        if i < I and k_a < K:
+            a_pos = a_batch_off + i * a_strides[1] + k_a * a_strides[2]
+            a_shared[pi, pj] = a_storage[a_pos]
+        else:
+            a_shared[pi, pj] = 0.0
+
+        # 将 B 的一块搬入共享内存：B[k_b, j]
+        if j < J and k_b < K:
+            b_pos = b_batch_off + k_b * b_strides[1] + j * b_strides[2]
+            b_shared[pi, pj] = b_storage[b_pos]
+        else:
+            b_shared[pi, pj] = 0.0
+
+        # 等待块内所有线程完成装载
+        cuda.syncthreads()
+
+        # 在共享内存上做小块乘累加：acc += sum_{kk} A[i, kk] * B[kk, j]
+        for kk in range(BLOCK_DIM):
+            acc += a_shared[pi, kk] * b_shared[kk, pj]
+
+        # 确保本轮 tile 的计算完成后再进入下轮装载
+        cuda.syncthreads()
+
+    # 写回全局内存（一次写）：仅当 (i, j) 在 out 范围内
+    if i < I and j < J:
+        out_pos = batch * out_strides[0] + i * out_strides[1] + j * out_strides[2]
+        out[out_pos] = acc
 
 
 tensor_matrix_multiply = jit(_tensor_matrix_multiply)
